@@ -1,13 +1,24 @@
 # Headroom
 
-A small, fast system monitor for Linux, written in Rust with [gpui](https://www.gpui.rs/).
-It sits in the top bar as a RAM percentage and opens a window that shows where your RAM,
-CPU and GPU go, and why Linux is killing your apps.
+A small, fast system monitor for Linux and macOS, written in Rust with
+[gpui](https://www.gpui.rs/). It sits in the top bar as a RAM percentage and opens a window
+that shows where your RAM, CPU and GPU go, and on Linux why the system is killing your apps.
 
-It is built to be left running: about 0.05% CPU in the tray and around 1% with the window
-open.
+It is built to be left running: on Linux about 0.05% CPU in the tray and around 1% with the
+window open.
+
+![The Memory tab: RAM in use, memory pressure, what needs attention and RAM per app](docs/screenshot-memory.png)
+
+| CPU | GPU | Settings |
+|---|---|---|
+| ![The CPU tab](docs/screenshot-cpu.png) | ![The GPU tab](docs/screenshot-gpu.png) | ![The Settings view](docs/screenshot-settings.png) |
+
+The screenshots are the macOS build in demo mode (`headroom --demo`), which shows a simulated
+machine, so nothing in them comes from a real computer.
 
 ## What it shows
+
+This is the Linux layout. The [macOS](#macos) section lists what differs there.
 
 - **Top bar**: the % of RAM used, with a bar under it that turns green, amber or red with
   memory pressure. Click it to open the window. It needs GNOME's AppIndicator extension,
@@ -38,9 +49,62 @@ Data is sampled every 2 seconds. Between samples, numbers, bars and rows ease to
 values in about a third of a second and the charts slide one slot. Frames are only drawn
 while something is moving.
 
+## Settings
+
+The Settings segment next to the tabs (or `headroom --settings`) has two things:
+
+- **Start at login**: starts Headroom in the top bar when you log in. On Linux it writes
+  `~/.config/autostart/headroom.desktop`; on macOS it adds a launch agent for your account
+  only. Turning it off removes the file again.
+- **Show in the top bar**: RAM, CPU and GPU, in any combination, with RAM only by default.
+  With the window closed, CPU is read every 2 s and GPU every 20 s, so showing them costs
+  nothing measurable.
+
+Choices are saved in `~/.config/headroom/settings` and apply right away.
+
+## macOS
+
+Headroom runs on Apple Silicon and builds with only the Command Line Tools; Xcode is not
+needed, because gpui's shaders are compiled at launch.
+
+- **Menu bar item** in place of the tray icon: the chosen values as text, with a menu to
+  open the window or quit. `headroom --tray` starts with just the menu bar item.
+- **Memory**: RAM in use and the kernel's memory pressure level (Normal, Elevated,
+  Critical), a breakdown into apps, compressed, wired and system, freeable cache and free,
+  swap, and RAM per app with the 1-hour trend. Helper processes are grouped under their
+  app. Processes owned by other users are skipped.
+- **CPU**: total, load average, a meter per core and per-app CPU, threads and CPU time.
+- **GPU**: how busy the Apple GPU is (overall, renderer and tiler) and the memory it uses.
+
+Not available on macOS, because there is no public source for them: the out-of-memory kill
+history and kill limit, CPU temperature and clock speed, GPU temperature and power, and
+per-app swap and GPU use. Those parts of the window are hidden. The accessibility tree and
+the board sensors are Linux only.
+
+Measured on an M1 with 16 GB on 11 November 2026:
+
+| | CPU |
+|---|---|
+| Menu bar only | about 0.3% |
+| Window open, Memory tab | about 1.7% |
+| Window open, CPU tab | about 2.3% |
+| Window open, GPU tab | about 0.9% |
+
+That is higher than on Linux. gpui keeps a display link running while a window is visible,
+which costs about 1% on its own, and the per-app sparklines on the CPU tab are drawn as
+many small bars. The numbers ease at 30 frames a second on macOS to keep this down.
+
+## Demo mode
+
+`headroom --demo` fills every tab with a simulated machine and a fixed cast of apps. It
+reads nothing from the system, saves no settings, sends no notifications and never signals
+a process, and it runs next to a real copy without getting in its way. It exists so that
+screenshots and recordings never show a real computer. `headroom --demo --dump` prints the
+simulated report.
+
 ## Cost
 
-Measured on 10 and 11 November 2026 on a laptop running about 575 processes.
+Measured on Linux on 10 and 11 November 2026, on a laptop running about 575 processes.
 
 | | CPU | Wake-ups | Own RAM |
 |---|---|---|---|
@@ -91,6 +155,17 @@ window measured 4.8%: 3.6% on the drawing thread and 0.4% on the board-sensor th
 
 ## Install
 
+On macOS, with Rust installed:
+
+```bash
+git clone https://github.com/bernisnukic/headroom
+cd headroom
+cargo build --release
+./target/release/headroom
+```
+
+On Linux:
+
 ```bash
 git clone https://github.com/bernisnukic/headroom
 cd headroom
@@ -120,8 +195,10 @@ headroom            # open the window
 headroom --tray &   # start in the top bar
 headroom --cpu      # open on the CPU tab, or switch a running copy to it
 headroom --gpu      # the same for the GPU tab
+headroom --settings # the same for Settings
 headroom --dump     # print the same report in the terminal
 headroom --bench    # print how long each part of a refresh takes
+headroom --demo     # show a simulated machine instead of this one
 ```
 
 Headroom is single-instance: a second launch opens the window of the copy that is already
