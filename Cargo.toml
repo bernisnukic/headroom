@@ -1,0 +1,26 @@
+[package]
+name = "headroom"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+accesskit = "0.25.2"
+accesskit_unix = "0.24"
+anyhow = "1.0.104"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+gpui = "0.2.2"
+ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
+libc = "0.2"
+nvml-wrapper = "0.13.0"
+
+[patch.crates-io]
+# libc 0.2.19x dropped ENOATTR (== ENODATA on Linux); gpui pulls xattr 0.2.3 via zed-async-tar
+xattr = { path = "vendor/xattr" }
+# connect to AT-SPI regardless of org.a11y.Status IsEnabled (see vendor/accesskit_unix/src/context.rs)
+accesskit_unix = { path = "vendor/accesskit_unix" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true

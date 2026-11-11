@@ -1,0 +1,5 @@
+# libxkbcommon-x11.so (the -dev symlink) is missing unless libxkbcommon-x11-dev
+# is installed; linklibs/ holds a symlink to the runtime .so.0 instead.
+# Relative: cargo runs rustc from the package root.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-L", "native=linklibs"]
