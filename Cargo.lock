@@ -2524,11 +2524,13 @@ dependencies = [
  "accesskit",
  "accesskit_unix",
  "anyhow",
+ "core-foundation 0.10.0",
  "futures",
  "gpui",
  "ksni",
  "libc",
  "nvml-wrapper",
+ "objc",
 ]
 
 [[package]]

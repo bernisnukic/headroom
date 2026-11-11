@@ -1,17 +1,18 @@
 //! Top-bar icon (StatusNotifierItem — shown by Ubuntu's AppIndicator extension).
 //! Draws "used %" in a 3x5 pixel font with a pressure-coloured bar under it.
+//! With CPU or GPU also chosen in Settings, the digits show the first chosen
+//! value and each chosen value gets its own thinner bar; the title and tooltip
+//! spell all of them out.
 
 use futures::channel::mpsc::UnboundedSender as Sender;
 
 use ksni::blocking::{Handle, TrayMethods};
 
-use crate::Cmd;
+use crate::settings::BarItem;
+use crate::{BarState, Cmd};
 
 pub struct RamTray {
-    pub used_pct: u8,
-    /// 0 = fine, 1 = warn, 2 = bad
-    pub level: u8,
-    pub tip: String,
+    pub state: BarState,
     tx: Sender<Cmd>,
 }
 
@@ -38,7 +39,22 @@ fn level_rgb(level: u8) -> [u8; 3] {
     }
 }
 
-pub fn draw(used_pct: u8, level: u8) -> ksni::Icon {
+/// CPU and GPU have no insight levels of their own here; colour by value.
+fn busy_level(v: u8) -> u8 {
+    if v >= 90 {
+        2
+    } else if v >= 75 {
+        1
+    } else {
+        0
+    }
+}
+
+pub fn draw(s: &BarState) -> ksni::Icon {
+    let items = if s.items.is_empty() { vec![(BarItem::Ram, s.used_pct)] } else { s.items.clone() };
+    let lvl = |item: BarItem, v: u8| if item == BarItem::Ram { s.level } else { busy_level(v) };
+    let (first_item, first) = items[0];
+    let level = lvl(first_item, first);
     let mut px = vec![0u8; (N * N * 4) as usize];
     let mut put = |x: i32, y: i32, argb: [u8; 4]| {
         if (0..N).contains(&x) && (0..N).contains(&y) {
@@ -46,7 +62,7 @@ pub fn draw(used_pct: u8, level: u8) -> ksni::Icon {
             px[i..i + 4].copy_from_slice(&argb);
         }
     };
-    let pct = used_pct.min(99);
+    let pct = first.min(99);
     let digits = [pct / 10, pct % 10];
     let (sx, sy) = (4, 4); // pixel scale
     let text = if level == 0 { [0xff, 0xff, 0xff] } else { level_rgb(level) };
@@ -64,15 +80,22 @@ pub fn draw(used_pct: u8, level: u8) -> ksni::Icon {
             }
         }
     }
-    // bar
-    let fill = (used_pct as i32 * N / 100).clamp(1, N);
-    let c = level_rgb(level);
-    for y in 25..31 {
-        for x in 0..N {
-            if x < fill {
-                put(x, y, [0xff, c[0], c[1], c[2]]);
-            } else {
-                put(x, y, [0x70, 0xff, 0xff, 0xff]);
+    // bars: one full-height bar as always, or two or three thinner ones
+    let rows: &[(i32, i32)] = match items.len() {
+        1 => &[(25, 31)],
+        2 => &[(23, 26), (28, 31)],
+        _ => &[(23, 25), (26, 28), (29, 31)],
+    };
+    for (&(item, v), &(y0, y1)) in items.iter().zip(rows) {
+        let fill = (v as i32 * N / 100).clamp(1, N);
+        let c = level_rgb(lvl(item, v));
+        for y in y0..y1 {
+            for x in 0..N {
+                if x < fill {
+                    put(x, y, [0xff, c[0], c[1], c[2]]);
+                } else {
+                    put(x, y, [0x70, 0xff, 0xff, 0xff]);
+                }
             }
         }
     }
@@ -84,16 +107,16 @@ impl ksni::Tray for RamTray {
         "headroom".into()
     }
     fn title(&self) -> String {
-        format!("RAM {}%", self.used_pct)
+        self.state.text()
     }
     fn category(&self) -> ksni::Category {
         ksni::Category::SystemServices
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        vec![draw(self.used_pct, self.level)]
+        vec![draw(&self.state)]
     }
     fn tool_tip(&self) -> ksni::ToolTip {
-        ksni::ToolTip { title: self.title(), description: self.tip.clone(), ..Default::default() }
+        ksni::ToolTip { title: self.title(), description: self.state.tip.clone(), ..Default::default() }
     }
     fn activate(&mut self, _x: i32, _y: i32) {
         let _ = self.tx.unbounded_send(Cmd::Show);
@@ -102,7 +125,7 @@ impl ksni::Tray for RamTray {
         use ksni::menu::*;
         vec![
             StandardItem {
-                label: format!("Open Headroom ({}% used)", self.used_pct),
+                label: format!("Open Headroom ({}% used)", self.state.used_pct),
                 activate: Box::new(|t: &mut Self| {
                     let _ = t.tx.unbounded_send(Cmd::Show);
                 }),
@@ -123,7 +146,7 @@ impl ksni::Tray for RamTray {
 }
 
 pub fn spawn(tx: Sender<Cmd>) -> Option<Handle<RamTray>> {
-    RamTray { used_pct: 0, level: 0, tip: String::new(), tx }
+    RamTray { state: BarState::default(), tx }
         .spawn()
         .map_err(|e| eprintln!("headroom: tray unavailable: {e}"))
         .ok()

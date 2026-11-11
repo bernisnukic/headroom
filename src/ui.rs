@@ -10,6 +10,7 @@ use gpui::{
 
 use crate::cpu::{CpuApp, CpuSnap};
 use crate::gpu::{GpuApp, GpuSnap};
+use crate::settings::BarItem;
 use crate::{Monitor, Tab};
 use crate::collect::{App as AppUse, GIB, Level, MIB, fmt_age, fmt_kib};
 
@@ -32,9 +33,18 @@ const WARN: u32 = 0xe0a23a;
 const BAD: u32 = 0xf0524f;
 
 const R: f32 = 4.0;
+#[cfg(not(target_os = "macos"))]
 const SANS: &str = "Ubuntu Sans";
+#[cfg(not(target_os = "macos"))]
 const MONO: &str = "Ubuntu Sans Mono";
+#[cfg(target_os = "macos")]
+const SANS: &str = ".SystemUIFont";
+#[cfg(target_os = "macos")]
+const MONO: &str = "Menlo";
 const EDGE: f32 = 6.0; // resize grab margin
+/// macOS: native window frame and traffic lights, no swap, GPU or kill
+/// figures per app, and a pressure level instead of PSI.
+const MAC: bool = cfg!(target_os = "macos");
 
 fn c(hex: u32) -> Rgba {
     rgb(hex)
@@ -52,12 +62,14 @@ pub struct RamView {
     monitor: Entity<Monitor>,
     _sub: Subscription,
     tw: crate::anim::Tw,
+    /// macOS: a timed redraw is already on its way.
+    frame_pending: bool,
 }
 
 impl RamView {
     pub fn new(monitor: Entity<Monitor>, cx: &mut Context<Self>) -> Self {
         let _sub = cx.observe(&monitor, |_, _, cx| cx.notify());
-        Self { monitor, _sub, tw: crate::anim::Tw::new() }
+        Self { monitor, _sub, tw: crate::anim::Tw::new(), frame_pending: false }
     }
 }
 
@@ -159,8 +171,15 @@ fn sparkline(vals: &[u64], color: u32) -> impl IntoElement {
     bars(pts, 40, 0.0, 0.0).w(px(80.)).h(px(14.))
 }
 
+#[cfg(not(target_os = "macos"))]
 pub const NO_QUIT: &[&str] =
     &["gnome-shell", "Xwayland", "systemd", "headroom", "pipewire", "wireplumber", "gnome-session-binary"];
+/// Stopping loginwindow logs you out; the rest are the session's own parts.
+#[cfg(target_os = "macos")]
+pub const NO_QUIT: &[&str] = &[
+    "loginwindow", "Dock", "Finder", "SystemUIServer", "ControlCenter", "NotificationCenter", "WindowManager",
+    "headroom", "cfprefsd", "distnoted", "launchd", "UserEventAgent", "universalaccessd", "TextInputMenuAgent",
+];
 
 const COLS: [f32; 6] = [70., 64., 64., 88., 72., 56.];
 
@@ -189,18 +208,18 @@ fn app_row(a: &AppUse, pending: Option<&str>, monitor: &Entity<Monitor>, wide: b
         .whitespace_nowrap()
         .child(div().flex_1().min_w(px(140.)).overflow_hidden().truncate().text_color(c(TEXT)).child(a.name.clone()))
         .child(mono(pad(fmt_kib(a.pss), 7)).w(px(COLS[0])).text_right().text_color(c(size_col)))
-        .child(
+        .when(!MAC, |d| d.child(
             mono(pad(if a.swap > 1024 { fmt_kib(a.swap) } else { "-".into() }, 7))
                 .w(px(COLS[1]))
                 .text_right()
                 .text_color(c(if a.swap > 256 * MIB { WARN } else { DIM })),
-        )
-        .child(
+        ))
+        .when(!MAC, |d| d.child(
             mono(pad(if a.gpu > 1024 { fmt_kib(a.gpu) } else { "-".into() }, 7))
                 .w(px(COLS[2]))
                 .text_right()
                 .text_color(c(if a.gpu > 3 * GIB { BAD } else { DIM })),
-        )
+        ))
         .when(wide, |d| d.child(div().w(px(COLS[3])).flex().justify_end().when(a.spark.len() >= 3, |d| d.child(sparkline(&a.spark, trend_col))).when(a.spark.len() < 3, |d| d.child(mono(pad("-", 7)).text_color(c(DIM))))))
         .child(
             mono(pad(
@@ -276,7 +295,88 @@ fn tab_button(label: &'static str, tab: Tab, active: bool, monitor: &Entity<Moni
         .on_click(move |_, _, cx| m.update(cx, |m, cx| m.set_tab(tab, cx)))
 }
 
-fn titlebar(summary: String, tab: Tab, monitor: &Entity<Monitor>) -> impl IntoElement {
+/// The fourth segment beside the tabs; opens and closes the settings view.
+fn settings_button(active: bool, monitor: &Entity<Monitor>) -> impl IntoElement {
+    let m = monitor.clone();
+    div()
+        .id("Settings")
+        .px_3()
+        .h(px(24.))
+        .flex()
+        .items_center()
+        .rounded(px(R))
+        .cursor_pointer()
+        .text_size(px(12.5))
+        .when(active, |d| d.bg(c(HOVER)).text_color(c(TEXT)))
+        .when(!active, |d| d.text_color(c(DIM)).hover(|s| s.text_color(c(TEXT))))
+        .child("Settings")
+        .on_click(move |_, _, cx| m.update(cx, |m, cx| m.open_settings(!active, cx)))
+}
+
+fn checkbox(id: &'static str, label: &'static str, on: bool, enabled: bool) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_3()
+        .h(px(30.))
+        .px_2()
+        .rounded(px(R))
+        .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(c(HOVER))))
+        .when(!enabled, |d| d.opacity(0.5))
+        .child(
+            div()
+                .w(px(14.))
+                .h(px(14.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(3.))
+                .border_1()
+                .border_color(c(if on { ACCENT } else { DIM }))
+                .when(on, |d| d.bg(c(ACCENT)).child(div().w(px(6.)).h(px(6.)).rounded(px(1.)).bg(c(BG)))),
+        )
+        .child(div().text_color(c(TEXT)).child(label))
+}
+
+fn note(text: &'static str) -> gpui::Div {
+    div().px_2().text_color(c(DIM)).line_height(px(19.)).child(text)
+}
+
+fn settings_view(m: &Monitor, monitor: &Entity<Monitor>) -> gpui::Div {
+    let mm = monitor.clone();
+    let login = checkbox("set-login", "Start Headroom at login, in the top bar", m.autostart, true)
+        .on_click(move |_, _, cx| mm.update(cx, |m, cx| m.toggle_autostart(cx)));
+    let login_note = if MAC {
+        "Adds a launch agent to ~/Library/LaunchAgents for your account only. Turning it off removes it."
+    } else {
+        "Adds headroom.desktop to ~/.config/autostart, as install.sh --autostart does. Turning it off removes it."
+    };
+    let mut bar = section("Show in the top bar");
+    for item in BarItem::ALL {
+        let (id, label) = match item {
+            BarItem::Ram => ("set-ram", "RAM in use"),
+            BarItem::Cpu => ("set-cpu", "CPU busy"),
+            BarItem::Gpu => ("set-gpu", "GPU busy"),
+        };
+        let mm = monitor.clone();
+        bar = bar.child(
+            checkbox(id, label, m.settings.shows(item), m.settings.can_toggle(item))
+                .on_click(move |_, _, cx| mm.update(cx, |m, cx| m.toggle_bar(item, cx))),
+        );
+    }
+    let bar = bar.child(note(
+        "At least one stays on. While the window is closed, CPU is read every 2 s as before and GPU every 20 s.",
+    ));
+    div()
+        .flex()
+        .flex_col()
+        .gap_5()
+        .child(div().flex().flex_col().gap_2().child(heading("Start at login")).child(login).child(note(login_note)))
+        .child(bar)
+}
+
+fn titlebar(summary: String, tab: Tab, settings_open: bool, monitor: &Entity<Monitor>) -> impl IntoElement {
     div()
         .id("titlebar")
         .flex()
@@ -284,13 +384,18 @@ fn titlebar(summary: String, tab: Tab, monitor: &Entity<Monitor>) -> impl IntoEl
         .items_center()
         .justify_between()
         .h(px(40.))
-        .pl_4()
+        .when(!MAC, |d| d.pl_4())
+        // room for the traffic lights
+        .when(MAC, |d| d.pl(px(84.)))
         .pr_2()
         .bg(c(SURFACE))
         .border_b_1()
         .border_color(c(HAIR))
         .on_mouse_down(MouseButton::Left, |e, window, _| {
-            if e.click_count >= 2 {
+            if e.click_count >= 2 && MAC {
+                // zoom or minimise, as set in System Settings
+                window.titlebar_double_click();
+            } else if e.click_count >= 2 {
                 window.zoom_window();
             } else {
                 window.start_window_move();
@@ -316,13 +421,14 @@ fn titlebar(summary: String, tab: Tab, monitor: &Entity<Monitor>) -> impl IntoEl
                         .rounded(px(R + 2.))
                         .bg(c(BG))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(tab_button("Memory", Tab::Memory, tab == Tab::Memory, monitor))
-                        .child(tab_button("CPU", Tab::Cpu, tab == Tab::Cpu, monitor))
-                        .child(tab_button("GPU", Tab::Gpu, tab == Tab::Gpu, monitor)),
+                        .child(tab_button("Memory", Tab::Memory, tab == Tab::Memory && !settings_open, monitor))
+                        .child(tab_button("CPU", Tab::Cpu, tab == Tab::Cpu && !settings_open, monitor))
+                        .child(tab_button("GPU", Tab::Gpu, tab == Tab::Gpu && !settings_open, monitor))
+                        .child(settings_button(settings_open, monitor)),
                 )
                 .child(mono(summary).ml_2().text_color(c(DIM)).text_size(px(12.))),
         )
-        .child(
+        .when(!MAC, |d| d.child(
             div()
                 .flex()
                 .gap_1()
@@ -330,7 +436,7 @@ fn titlebar(summary: String, tab: Tab, monitor: &Entity<Monitor>) -> impl IntoEl
                 .child(control("min", "\u{2212}", false).on_click(|_, w, _| w.minimize_window()))
                 .child(control("max", "\u{25a1}", false).on_click(|_, w, _| w.zoom_window()))
                 .child(control("close", "\u{00d7}", true).on_click(|_, w, _| w.remove_window())),
-        )
+        ))
 }
 
 fn fmt_cpu_time(s: u64) -> String {
@@ -405,12 +511,12 @@ fn cpu_row(a: &CpuApp, gpu: Option<f32>, pending: Option<&str>, monitor: &Entity
                 .text_right()
                 .text_color(c(if hot { WARN } else if a.pct < 0.05 { DIM } else { TEXT })),
         )
-        .child(
+        .when(!MAC, |d| d.child(
             mono(pad(gpu.filter(|g| *g >= 0.5).map(|g| format!("{g:.0}%")).unwrap_or_else(|| "-".into()), 5))
                 .w(px(GPU_COL))
                 .text_right()
                 .text_color(c(if gpu.is_some_and(|g| g >= 80.0) { WARN } else { DIM })),
-        )
+        ))
         .when(wide, |d| {
             d.child(div().w(px(CPU_COLS[1])).flex().justify_end().child(spark_f(&a.spark, if hot { WARN } else { ACCENT_2 })))
         })
@@ -450,7 +556,8 @@ fn insight_list(items: &[crate::collect::Insight]) -> gpui::Div {
             .flex()
             .gap_3()
             .child(div().w(px(2.)).flex_none().rounded(px(1.)).bg(c(level_color(ins.level))))
-            .child(div().flex_1().text_color(c(TEXT)).line_height(px(19.)).child(ins.text.clone()))
+            // min width 0 lets a long line wrap instead of running off the edge
+            .child(div().flex_1().min_w(px(0.)).text_color(c(TEXT)).line_height(px(19.)).child(ins.text.clone()))
     }))
 }
 
@@ -493,7 +600,12 @@ fn cpu_view(
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(c(if s.total >= 90.0 { WARN } else { TEXT })),
                         )
-                        .child(div().pb(px(5.)).text_color(c(DIM)).child(format!("busy across {n} threads"))),
+                        .child(div().pb(px(5.)).text_color(c(DIM)).child(if MAC {
+                            // Apple Silicon has no SMT
+                            format!("busy across {n} cores")
+                        } else {
+                            format!("busy across {n} threads")
+                        })),
                 )
                 .child(div().text_color(c(DIM)).child(format!(
                     "Load {:.2}, {:.2}, {:.2} over 1, 5 and 15 min",
@@ -501,7 +613,8 @@ fn cpu_view(
                 )))
                 .when(!g.devices.is_empty(), |d| d.child(div().text_color(c(DIM)).child(gpu_summary(g)))),
         )
-        .child(
+        // temperature and clock: no public source on Apple Silicon
+        .when(!MAC, |d| d.child(
             div()
                 .flex()
                 .flex_col()
@@ -530,7 +643,7 @@ fn cpu_view(
                     ),
                     None => format!("{:.1} of {:.1} GHz", s.freq_mhz as f32 / 1000.0, s.max_mhz as f32 / 1000.0),
                 })),
-        );
+        ));
 
     let history = div()
         .flex()
@@ -581,7 +694,7 @@ fn cpu_view(
             .whitespace_nowrap()
             .child(div().flex_1().min_w(px(140.)).child("Name"))
             .child(col_head(CPU_COLS[0], "CPU"))
-            .child(col_head(GPU_COL, "GPU"))
+            .when(!MAC, |d| d.child(col_head(GPU_COL, "GPU")))
             .when(wide, |d| d.child(col_head(CPU_COLS[1], "Last 2 min")))
             .child(col_head(CPU_COLS[2], "CPU time"))
             .when(wide, |d| d.child(col_head(CPU_COLS[3], "Threads")))
@@ -714,6 +827,10 @@ fn gpu_view(
         if let (Some(u), Some(t)) = (d.mem_used, d.mem_total) {
             facts.push(format!("{} of {} video memory", fmt_kib(u), fmt_kib(t)));
         }
+        // shared-memory GPUs (Apple) report what is in use but no total
+        if let (Some(u), None) = (d.mem_used, d.mem_total) {
+            facts.push(format!("{} of memory in use", fmt_kib(u)));
+        }
         let dgpu = crate::gpu::is_discrete(d);
         match (d.temp_c, dgpu.then_some(board.gpu_area_c).flatten()) {
             (Some(t), _) => facts.push(format!("{t:.0} °C")),
@@ -791,6 +908,12 @@ fn gpu_view(
         out = out.child(block);
     }
     out = out.child(insight_list(insights));
+    if MAC {
+        return out.child(
+            section("Apps")
+                .child(div().text_color(c(DIM)).child("macOS does not report GPU use per app without admin rights.")),
+        );
+    }
 
     let col_head = |w: f32, t: String| div().w(px(w)).text_right().child(t);
     let mut header = div()
@@ -851,6 +974,31 @@ fn cursor_for(edge: ResizeEdge) -> CursorStyle {
     }
 }
 
+/// The big pressure figure: its text, caption and colour, and the colour of
+/// the "in use" figure.
+#[cfg(not(target_os = "macos"))]
+fn pressure_view(s: &crate::collect::Snapshot, lim: f32, used_frac: f32) -> (String, String, u32, u32) {
+    let p = s.user_psi.full10;
+    let p_col = if p >= lim * 0.8 {
+        BAD
+    } else if p >= lim * 0.4 {
+        WARN
+    } else {
+        TEXT
+    };
+    let head_col = if used_frac > 0.9 { BAD } else { TEXT };
+    (format!("{p:.0}%"), format!("pressure, apps get killed at {lim:.0}%"), p_col, head_col)
+}
+
+/// macOS fills RAM on purpose (cache, compression) and has no PSI, so the
+/// kernel's own pressure level leads and a high "in use" is not alarming.
+#[cfg(target_os = "macos")]
+fn pressure_view(s: &crate::collect::Snapshot, _lim: f32, _used_frac: f32) -> (String, String, u32, u32) {
+    let col = level_color(s.pressure.level());
+    let col = if col == OK { TEXT } else { col };
+    (s.pressure.label().to_string(), "memory pressure".to_string(), col, if col == BAD { BAD } else { TEXT })
+}
+
 impl Render for RamView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let csd = matches!(window.window_decorations(), Decorations::Client { .. });
@@ -867,16 +1015,7 @@ impl Render for RamView {
         let gpu_shifts: Vec<f32> = (0..s.gpu.devices.len()).map(|i| self.tw.gpu_shift(i)).collect();
         let mem = &s.mem;
         let used_frac = mem.used() as f32 / mem.total.max(1) as f32;
-        let p = s.user_psi.full10;
-        let lim = m.policy.limit_pct;
-        let p_col = if p >= lim * 0.8 {
-            BAD
-        } else if p >= lim * 0.4 {
-            WARN
-        } else {
-            TEXT
-        };
-        let head_col = if used_frac > 0.9 { BAD } else { TEXT };
+        let (p_text, p_caption, p_col, head_col) = pressure_view(s, m.policy.limit_pct, used_frac);
 
         let tmpfs = s.tmpfs.min(mem.shmem);
         let shared = mem.shmem - tmpfs;
@@ -918,13 +1057,13 @@ impl Render for RamView {
                     .items_end()
                     .gap_1()
                     .child(
-                        mono(format!("{p:.0}%"))
+                        mono(p_text)
                             .text_size(px(26.))
                             .line_height(px(30.))
                             .font_weight(FontWeight::BOLD)
                             .text_color(c(p_col)),
                     )
-                    .child(div().text_color(c(DIM)).child(format!("pressure, apps get killed at {lim:.0}%"))),
+                    .child(div().text_color(c(DIM)).child(p_caption)),
             );
 
         let breakdown = div()
@@ -938,9 +1077,10 @@ impl Render for RamView {
                     .flex_wrap()
                     .gap_y_2()
                     .child(legend(ACCENT, "Apps", fmt_kib(mem.anon)))
-                    .child(legend(ACCENT_2, "GPU and shared", fmt_kib(shared)))
-                    .child(legend(ACCENT_3, "/tmp in RAM", fmt_kib(tmpfs)))
-                    .child(legend(KERNEL, "Kernel", fmt_kib(mem.kernel)))
+                    // macOS: `shmem` holds the compressor's memory, `kernel` wired memory
+                    .child(legend(ACCENT_2, if MAC { "Compressed" } else { "GPU and shared" }, fmt_kib(shared)))
+                    .when(!MAC, |d| d.child(legend(ACCENT_3, "/tmp in RAM", fmt_kib(tmpfs))))
+                    .child(legend(KERNEL, if MAC { "Wired and system" } else { "Kernel" }, fmt_kib(mem.kernel)))
                     .child(legend(CACHE, "Cache, freeable", fmt_kib(mem.file_cache)))
                     .child(legend(TRACK, "Free", fmt_kib(mem.free))),
             )
@@ -951,7 +1091,8 @@ impl Render for RamView {
                     .gap_3()
                     .child(div().w(px(40.)).text_color(c(DIM)).child("Swap"))
                     .child(div().flex_1().child(stacked(
-                        &[(if mem.swap_used * 10 > mem.swap_total * 8 { WARN } else { KERNEL }, mem.swap_used)],
+                        // macOS grows the swap file as it fills, so "nearly full" means nothing there
+                        &[(if !MAC && mem.swap_used * 10 > mem.swap_total * 8 { WARN } else { KERNEL }, mem.swap_used)],
                         mem.swap_total,
                         6.,
                     )))
@@ -976,8 +1117,8 @@ impl Render for RamView {
                     .whitespace_nowrap()
                     .child(div().flex_1().min_w(px(140.)).child("Name"))
                     .child(col_head(COLS[0], "RAM"))
-                    .child(col_head(COLS[1], "Swap"))
-                    .child(col_head(COLS[2], "GPU"))
+                    .when(!MAC, |d| d.child(col_head(COLS[1], "Swap")))
+                    .when(!MAC, |d| d.child(col_head(COLS[2], "GPU")))
                     .when(wide, |d| d.child(col_head(COLS[3], "Last hour")))
                     .child(col_head(COLS[4], "MB/h"))
                     .when(wide, |d| d.child(col_head(COLS[5], "Running")))
@@ -1029,8 +1170,10 @@ impl Render for RamView {
         });
 
         let footer = mono(match m.tab {
+            _ if m.show_settings => "Changes apply right away.".to_string(),
             Tab::Memory => format!("Refreshes every 2 s. Last scan took {} ms.", s.took.as_millis().max(1)),
             Tab::Cpu => format!("Refreshes every 2 s. Per-app CPU: 100% is one full core. Scan {} ms.", s.took.as_millis().max(1)),
+            Tab::Gpu if MAC => format!("Refreshes every 2 s. Utilisation as the GPU driver reports it. Scan {} ms.", s.took.as_millis().max(1)),
             Tab::Gpu => format!("Refreshes every 2 s. Per-app GPU: share of that GPU's busiest engine. Scan {} ms.", s.took.as_millis().max(1)),
         })
             .text_size(px(11.))
@@ -1043,10 +1186,15 @@ impl Render for RamView {
             None => format!("RAM {:.0}%  CPU {:.0}%", used_frac * 100.0, s.cpu.total),
         };
         let tab = m.tab;
-        let body = match tab {
-            Tab::Memory => div().flex().flex_col().gap_5().child(overview).child(breakdown).child(why).child(apps).child(kills),
+        let body = if m.show_settings {
+            settings_view(m, &self.monitor)
+        } else {
+            match tab {
+            // macOS keeps no OOM kill log a normal user can read
+            Tab::Memory => div().flex().flex_col().gap_5().child(overview).child(breakdown).child(why).child(apps).when(!MAC, |d| d.child(kills)),
             Tab::Cpu => cpu_view(&s.cpu, &m.cpu_insights, pending, &self.monitor, wide, &ys, ceiling, shift, &s.gpu, &s.board),
             Tab::Gpu => gpu_view(&s.gpu, &m.gpu_insights, pending, &self.monitor, wide, &ys, &gpu_shifts, &s.board),
+            }
         };
         let content = div()
             .id("content")
@@ -1066,7 +1214,22 @@ impl Render for RamView {
 
         // Keep drawing only while something is still easing toward the
         // latest sample; once settled (about 0.4 s), no frames until the next.
-        if self.tw.moving {
+        if self.tw.moving && MAC {
+            // gpui on macOS draws at the display's full refresh rate; 30 fps
+            // is plenty for numbers easing into place and halves the cost.
+            // The easing is time-based, so it still settles in about 0.4 s.
+            if !self.frame_pending {
+                self.frame_pending = true;
+                cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor().timer(std::time::Duration::from_millis(33)).await;
+                    let _ = this.update(cx, |v, cx| {
+                        v.frame_pending = false;
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+        } else if self.tw.moving {
             window.request_animation_frame();
         }
 
@@ -1081,7 +1244,8 @@ impl Render for RamView {
             .cursor(CursorStyle::Arrow)
             .when(csd && !maximized, |d| d.border_1().border_color(c(HAIR)).rounded(px(8.)))
             .overflow_hidden()
-            .when(csd, |d| d.child(titlebar(summary, tab, &self.monitor)))
+            // macOS draws the frame itself; the bar fills its transparent title bar
+            .when(csd || MAC, |d| d.child(titlebar(summary, tab, m.show_settings, &self.monitor)))
             .child(content);
 
         if !csd || maximized {

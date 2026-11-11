@@ -1,9 +1,18 @@
+#[cfg_attr(target_os = "macos", path = "macos/a11y.rs")]
 mod a11y;
 mod anim;
+#[cfg_attr(target_os = "macos", path = "macos/collect.rs")]
 mod collect;
+#[cfg_attr(target_os = "macos", path = "macos/cpu.rs")]
 mod cpu;
+mod demo;
+#[cfg_attr(target_os = "macos", path = "macos/gpu.rs")]
 mod gpu;
+// finds no sensors on macOS and stays idle
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod sensors;
+mod settings;
+#[cfg_attr(target_os = "macos", path = "macos/tray.rs")]
 mod tray;
 mod ui;
 
@@ -23,10 +32,59 @@ use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 
 use collect::{Collector, Insight, Kill, Level, OomdPolicy, Snapshot, fmt_kib};
+use settings::{BarItem, Settings};
 
+/// Where snapshots come from: this machine, or the made-up one in demo mode.
+enum Source {
+    Real(Collector),
+    Demo(demo::Demo),
+}
+
+impl Source {
+    fn collect(&mut self, want_cpu: bool, want_gpu: bool) -> Snapshot {
+        match self {
+            Source::Real(c) => c.collect(want_cpu, want_gpu),
+            Source::Demo(d) => d.snapshot(),
+        }
+    }
+
+    fn collect_light(&mut self, open: bool) -> Snapshot {
+        match self {
+            Source::Real(c) => c.collect_light(open),
+            Source::Demo(d) => d.snapshot(),
+        }
+    }
+}
+
+/// What the top-bar item shows. The tray is only redrawn when this changes,
+/// so it carries just the values that are on display.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct BarState {
+    /// RAM in use, %; also named in the tray menu.
+    pub used_pct: u8,
+    /// The chosen values, in RAM, CPU, GPU order.
+    pub items: Vec<(BarItem, u8)>,
+    /// Memory: 0 = fine, 1 = warn, 2 = bad.
+    pub level: u8,
+    pub tip: String,
+}
+
+impl BarState {
+    /// "RAM 62%  CPU 8%"
+    pub fn text(&self) -> String {
+        if self.items.is_empty() {
+            return format!("RAM {}%", self.used_pct);
+        }
+        self.items.iter().map(|(i, v)| format!("{} {v}%", i.label())).collect::<Vec<_>>().join("  ")
+    }
+}
+
+// macOS has no kill log and no AT-SPI, so some variants are never sent there
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub enum Cmd {
     Show,
     ShowTab(Tab),
+    ShowSettings,
     /// An assistive client connected and wants the tree.
     A11ySync,
     /// A click from an assistive client.
@@ -58,12 +116,39 @@ pub struct Monitor {
     window: Option<AnyWindowHandle>,
     kills_seen: Option<String>,
     last_pressure_alert: Option<Instant>,
+    pub settings: Settings,
+    /// Whether the start-at-login entry exists (kept in memory in demo mode).
+    pub autostart: bool,
+    pub show_settings: bool,
 }
 
+#[cfg(not(target_os = "macos"))]
 fn notify(urgency: &str, title: &str, body: &str) {
+    if demo::on() {
+        return;
+    }
     let _ = Command::new("notify-send")
         .args(["-a", "Headroom", "-i", "utilities-system-monitor", "-u", urgency, title, body])
         .spawn();
+}
+
+/// Notification Center through osascript; title and body go in as
+/// arguments, so nothing in them is parsed as AppleScript.
+#[cfg(target_os = "macos")]
+fn notify(_urgency: &str, title: &str, body: &str) {
+    if demo::on() {
+        return;
+    }
+    let child = Command::new("osascript")
+        .args(["-e", "on run argv", "-e", "display notification (item 2 of argv) with title (item 1 of argv)", "-e", "end run"])
+        .args([title, body])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    // reap it off the UI thread
+    if let Ok(mut c) = child {
+        std::thread::spawn(move || c.wait());
+    }
 }
 
 impl Monitor {
@@ -98,6 +183,18 @@ impl Monitor {
                 &format!("Memory pressure {p:.0}%, an app may be killed soon"),
                 &format!("systemd-oomd kills at {:.0}%. Biggest: {}", self.policy.limit_pct, top.join(", ")),
             );
+        }
+        // macOS: the kernel's own verdict, once it reaches critical
+        #[cfg(target_os = "macos")]
+        {
+            if snap.pressure.level >= 4
+                && self.last_pressure_alert.is_none_or(|t| t.elapsed() > Duration::from_secs(300))
+            {
+                self.last_pressure_alert = Some(Instant::now());
+                let top: Vec<String> =
+                    snap.apps.iter().take(3).map(|a| format!("{} {}", a.name, fmt_kib(a.total()))).collect();
+                notify("critical", "Memory pressure is critical", &format!("Biggest: {}", top.join(", ")));
+            }
         }
         self.insights = collect::insights(&snap, self.policy);
         self.cpu_insights = cpu::insights(&snap.cpu);
@@ -138,6 +235,7 @@ impl Monitor {
 
     pub fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         self.tab = tab;
+        self.show_settings = false;
         self.sync_a11y();
         if let Some(r) = &self.refresh {
             let _ = r.unbounded_send(());
@@ -149,7 +247,8 @@ impl Monitor {
         let confirmed =
             self.pending_quit.as_ref().is_some_and(|(n, t)| n == name && t.elapsed() < Duration::from_secs(4));
         if confirmed {
-            if let Some(a) = self.snap.apps.iter().find(|a| a.name == name) {
+            // demo pids are made up and may belong to real processes
+            if let Some(a) = self.snap.apps.iter().find(|a| a.name == name).filter(|_| !demo::on()) {
                 for pid in &a.pids {
                     unsafe { libc::kill(*pid, libc::SIGTERM) };
                 }
@@ -162,7 +261,42 @@ impl Monitor {
         cx.notify();
     }
 
-    fn tray_state(&self) -> (u8, u8, String) {
+    pub fn open_settings(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.show_settings = open;
+        cx.notify();
+    }
+
+    /// Shows or hides one top-bar value and saves the choice (memory only in
+    /// demo mode). The refresh loop is woken so the tray updates at once.
+    pub fn toggle_bar(&mut self, item: BarItem, cx: &mut Context<Self>) {
+        if !self.settings.toggle(item) {
+            return;
+        }
+        if !demo::on() {
+            if let Err(e) = settings::save(&self.settings) {
+                eprintln!("headroom: could not save settings: {e}");
+            }
+        }
+        if let Some(r) = &self.refresh {
+            let _ = r.unbounded_send(());
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_autostart(&mut self, cx: &mut Context<Self>) {
+        let on = !self.autostart;
+        if demo::on() {
+            self.autostart = on;
+        } else {
+            if let Err(e) = settings::set_autostart(on) {
+                eprintln!("headroom: could not change start at login: {e}");
+            }
+            self.autostart = settings::autostart_enabled();
+        }
+        cx.notify();
+    }
+
+    fn tray_state(&self) -> BarState {
         let m = &self.snap.mem;
         let used = (m.used() as f64 / m.total.max(1) as f64 * 100.0).round() as u8;
         let level = self
@@ -175,7 +309,9 @@ impl Monitor {
             })
             .max()
             .unwrap_or(0)
-            .max(if used >= 90 { 2 } else if used >= 80 { 1 } else { 0 });
+            // macOS keeps RAM nearly full on purpose (cache, compression), so
+            // only the pressure-based insights colour the icon there
+            .max(if cfg!(target_os = "macos") { 0 } else if used >= 90 { 2 } else if used >= 80 { 1 } else { 0 });
         let tip = self
             .snap
             .apps
@@ -184,11 +320,32 @@ impl Monitor {
             .map(|a| format!("{} {}", a.name, fmt_kib(a.total())))
             .collect::<Vec<_>>()
             .join("\n");
-        (used, level, tip)
+        let gpu = self.snap.gpu.devices.iter().filter(|d| !d.asleep).map(|d| d.busy).reduce(f32::max);
+        let items = BarItem::ALL
+            .into_iter()
+            .filter(|i| self.settings.shows(*i))
+            .filter_map(|i| match i {
+                BarItem::Ram => Some((i, used)),
+                BarItem::Cpu => Some((i, self.snap.cpu.total.round().clamp(0.0, 100.0) as u8)),
+                // not shown until the first GPU sample (or ever, without a GPU)
+                BarItem::Gpu => gpu.map(|g| (i, g.round().clamp(0.0, 100.0) as u8)),
+            })
+            .collect();
+        BarState { used_pct: used, items, level, tip }
     }
 }
 
 fn show_window(cx: &mut App, monitor: &Entity<Monitor>) {
+    // macOS raises an open window without fuss
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(h) = monitor.read(cx).window {
+            if h.update(cx, |_, w, _| w.activate_window()).is_ok() {
+                cx.activate(true);
+                return;
+            }
+        }
+    }
     // GNOME (Wayland) refuses to raise an existing window without an
     // xdg-activation token and posts a "<title> is ready" notice instead.
     // A freshly mapped window does get focus, so close and reopen.
@@ -197,24 +354,36 @@ fn show_window(cx: &mut App, monitor: &Entity<Monitor>) {
     }
     let bounds = Bounds::centered(None, size(px(760.), px(900.)), cx);
     let m = monitor.clone();
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions { title: Some("Headroom".into()), ..Default::default() }),
+        app_id: Some("headroom".into()),
+        window_min_size: Some(size(px(640.), px(420.))),
+        window_decorations: Some(WindowDecorations::Client),
+        window_background: WindowBackgroundAppearance::Transparent,
+        ..Default::default()
+    };
+    // The tab bar fills a transparent title bar, with the traffic lights
+    // centred in its 40 px.
+    #[cfg(target_os = "macos")]
+    let options = WindowOptions {
+        titlebar: Some(TitlebarOptions {
+            title: Some("Headroom".into()),
+            appears_transparent: true,
+            traffic_light_position: Some(gpui::point(px(14.), px(13.))),
+        }),
+        window_background: WindowBackgroundAppearance::Opaque,
+        ..options
+    };
     let handle = cx
-        .open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions { title: Some("Headroom".into()), ..Default::default() }),
-                app_id: Some("headroom".into()),
-                window_min_size: Some(size(px(640.), px(420.))),
-                window_decorations: Some(WindowDecorations::Client),
-                window_background: WindowBackgroundAppearance::Transparent,
-                ..Default::default()
-            },
-            |window, cx| {
-                window.set_window_title("Headroom");
-                cx.new(|cx| ui::RamView::new(m, cx))
-            },
-        )
+        .open_window(options, |window, cx| {
+            window.set_window_title("Headroom");
+            cx.new(|cx| ui::RamView::new(m, cx))
+        })
         .ok();
     monitor.update(cx, |m, _| m.window = handle.map(|h| h.into()));
+    #[cfg(target_os = "macos")]
+    cx.activate(true);
 }
 
 /// Without XDG_RUNTIME_DIR: /tmp/headroom-<uid>, which must be a real
@@ -255,7 +424,9 @@ fn socket_path() -> Option<PathBuf> {
             Some(d) => PathBuf::from(d),
             None => private_tmp()?,
         };
-        Some(dir.join(std::env::var("HEADROOM_SOCK").unwrap_or_else(|_| "headroom.sock".into())))
+        // a demo copy must neither take over nor be taken over by a real one
+        let name = if demo::on() { "headroom-demo.sock" } else { "headroom.sock" };
+        Some(dir.join(std::env::var("HEADROOM_SOCK").unwrap_or_else(|_| name.into())))
     })
     .clone()
 }
@@ -269,6 +440,8 @@ fn single_instance(tx: UnboundedSender<Cmd>) -> bool {
             b"cpu\n"
         } else if std::env::args().any(|a| a == "--gpu") {
             b"gpu\n"
+        } else if std::env::args().any(|a| a == "--settings") {
+            b"settings\n"
         } else {
             b"show\n"
         };
@@ -285,6 +458,8 @@ fn single_instance(tx: UnboundedSender<Cmd>) -> bool {
                 Cmd::ShowTab(Tab::Cpu)
             } else if buf[..n].starts_with(b"gpu") {
                 Cmd::ShowTab(Tab::Gpu)
+            } else if buf[..n].starts_with(b"settings") {
+                Cmd::ShowSettings
             } else {
                 Cmd::Show
             };
@@ -295,8 +470,16 @@ fn single_instance(tx: UnboundedSender<Cmd>) -> bool {
 }
 
 fn main() {
+    if demo::on() && std::env::args().any(|a| a == "--bench") {
+        eprintln!("--bench times the real collectors and does not run with --demo");
+        return;
+    }
     if std::env::args().any(|a| a == "--bench") {
         collect::bench();
+        return;
+    }
+    if demo::on() && std::env::args().any(|a| a == "--dump") {
+        demo::dump();
         return;
     }
     if std::env::args().any(|a| a == "--dump") {
@@ -309,11 +492,28 @@ fn main() {
         return;
     }
 
-    Application::new().run(move |cx: &mut App| {
-        let policy = collect::oomd_policy();
-        let mut collector = Collector::new();
-        let first = collector.collect(false, false);
-        let first_kills = collect::kills();
+    let app = Application::new();
+    // Dock icon clicked with no window open
+    #[cfg(target_os = "macos")]
+    {
+        let tx = tx.clone();
+        app.on_reopen(move |_| {
+            let _ = tx.unbounded_send(Cmd::Show);
+        });
+    }
+    app.run(move |cx: &mut App| {
+        #[cfg(target_os = "macos")]
+        mac_menus(cx);
+        // demo mode reads nothing from the system: no collectors, journal,
+        // sensors, settings file or autostart entry
+        let demo = demo::on();
+        let policy = if demo { demo::policy() } else { collect::oomd_policy() };
+        let mut collector = if demo { Source::Demo(demo::Demo::new()) } else { Source::Real(Collector::new()) };
+        let (settings, autostart) =
+            if demo { (Settings::default(), false) } else { (settings::load(), settings::autostart_enabled()) };
+        // a GPU value in the top bar should not wait for the first tray scan
+        let first = collector.collect(false, settings.bar_gpu);
+        let first_kills = if demo { demo::kills() } else { collect::kills() };
         let monitor = cx.new(|_| {
             let mut m = Monitor {
                 a11y: None,
@@ -335,6 +535,9 @@ fn main() {
                 window: None,
                 kills_seen: None,
                 last_pressure_alert: None,
+                settings,
+                autostart,
+                show_settings: std::env::args().any(|a| a == "--settings"),
             };
             m.apply(first, Some(first_kills));
             m
@@ -348,12 +551,15 @@ fn main() {
         // refresh loop: collect on a background thread, apply on the UI thread
         let collector = Arc::new(Mutex::new(collector));
         let board = Arc::new(Mutex::new(sensors::Board::default()));
-        let board_tx = sensors::spawn(board.clone());
+        let board_tx = if demo { None } else { sensors::spawn(board.clone()) };
         let m = monitor.clone();
         let tx_kills = tx.clone();
-        collect::watch_kills(move |k| {
-            let _ = tx_kills.unbounded_send(Cmd::Kill(k));
-        });
+        if !demo {
+            collect::watch_kills(move |k| {
+                let _ = tx_kills.unbounded_send(Cmd::Kill(k));
+            });
+        }
+        let has_tray = tray.is_some();
 
         let a11y_tx = tx.clone();
         monitor.update(cx, |m, _| {
@@ -385,7 +591,10 @@ fn main() {
                 let tab = m.read_with(cx, |m, _| m.tab).unwrap_or_default();
                 let want_cpu = open && tab == Tab::Cpu;
                 // GPU busy also feeds the CPU tab's GPU column
-                let want_gpu = open && matches!(tab, Tab::Cpu | Tab::Gpu);
+                // and the top bar, if it shows GPU: then it is read at every
+                // full scan, which is every 20 s while the window is closed
+                let bar_gpu = has_tray && m.read_with(cx, |m, _| m.settings.bar_gpu).unwrap_or(false);
+                let want_gpu = open && matches!(tab, Tab::Cpu | Tab::Gpu) || bar_gpu;
                 let pressured = m
                     .read_with(cx, |m, _| m.snap.user_psi.some10 > 5.0 || m.snap.mem.available * 10 < m.snap.mem.total)
                     .unwrap_or(false);
@@ -400,7 +609,7 @@ fn main() {
                     .spawn(async move {
                         let mut c = c.lock().unwrap();
                         let mut s = if full { c.collect(want_cpu, want_gpu) } else { c.collect_light(open) };
-                        if open {
+                        if open && !demo {
                             s.board = board.lock().unwrap().clone();
                         }
                         s
@@ -422,9 +631,7 @@ fn main() {
                 if let Some(t) = &tray {
                     if tray_shown.as_ref() != Some(&state) {
                         tray_shown = Some(state.clone());
-                        t.update(|t| {
-                            (t.used_pct, t.level, t.tip) = state;
-                        });
+                        t.update(move |t| t.state = state);
                     }
                 }
             }
@@ -445,6 +652,10 @@ fn main() {
                         m.update(cx, |m, cx| m.set_tab(t, cx));
                         show_window(cx, &m);
                     }
+                    Cmd::ShowSettings => {
+                        m.update(cx, |m, cx| m.open_settings(true, cx));
+                        show_window(cx, &m);
+                    }
                     Cmd::Quit => cx.quit(),
                     Cmd::Kill(k) => m.update(cx, |m, cx| {
                         m.add_kill(k);
@@ -460,7 +671,31 @@ fn main() {
     }
 }
 
+#[cfg(target_os = "macos")]
+gpui::actions!(headroom, [Quit, CloseWindow]);
+
+/// The app menu, so Cmd-Q and Cmd-W behave as on any Mac app.
+#[cfg(target_os = "macos")]
+fn mac_menus(cx: &mut App) {
+    use gpui::{KeyBinding, Menu, MenuItem};
+    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &CloseWindow, cx| {
+        if let Some(w) = cx.active_window() {
+            let _ = w.update(cx, |_, w, _| w.remove_window());
+        }
+    });
+    cx.bind_keys([KeyBinding::new("cmd-q", Quit, None), KeyBinding::new("cmd-w", CloseWindow, None)]);
+    cx.set_menus(vec![Menu {
+        name: "Headroom".into(),
+        items: vec![MenuItem::action("Close Window", CloseWindow), MenuItem::separator(), MenuItem::action("Quit Headroom", Quit)],
+    }]);
+}
+
+#[cfg(target_os = "macos")]
+use collect::dump;
+
 /// Terminal report: `headroom --dump`
+#[cfg(not(target_os = "macos"))]
 fn dump() {
     let mut c = Collector::new();
     let t = Instant::now();

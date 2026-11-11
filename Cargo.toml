@@ -4,14 +4,27 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-accesskit = "0.25.2"
-accesskit_unix = "0.24"
 anyhow = "1.0.104"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 gpui = "0.2.2"
-ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
 libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+accesskit = "0.25.2"
+accesskit_unix = "0.24"
+ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
 nvml-wrapper = "0.13.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+objc = "0.2"
+# Compile the Metal shaders when the app starts instead of at build time, so
+# the build needs only the Command Line Tools (no `xcrun metal`).
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+
+# objc 0.2's msg_send! tests `feature = "cargo-clippy"` inside our crate
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
 [patch.crates-io]
 # libc 0.2.19x dropped ENOATTR (== ENODATA on Linux); gpui pulls xattr 0.2.3 via zed-async-tar
